@@ -5,7 +5,9 @@ import random
 import sqlite3
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, field
+import aiosqlite
+import aiofiles
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, ChatMemberAdministrator, InputFile
@@ -17,11 +19,11 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest
 
 # Конфигурация
-TOKEN = "8022954037:AAHH75JVSpIBXGfmgV3PCZcR2h85Y5qSI5A"
-ADMIN_ID = 123456789  # Ваш ID для админки
+TOKEN = os.getenv("BOT_TOKEN", "8022954037:AAHH75JVSpIBXGfmgV3PCZcR2h85Y5qSI5A")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "123456789"))
 
 # Настройки базы данных
-DATABASE_FILE = "game_database.db"
+DATABASE_FILE = os.getenv("DATABASE_FILE", "game_database.db")
 WAR_IMAGES_FOLDER = "war_images"
 
 # Создаем папку для изображений войны, если она не существует
@@ -72,154 +74,115 @@ transfer_data = TransferData()
 # Глобальные переменные
 bot: Optional[Bot] = None
 
-# ========== БАЗА ДАННЫХ ==========
+# ========== АСИНХРОННАЯ БАЗА ДАННЫХ ==========
 
-def init_database():
+async def init_database():
     """Инициализация базы данных"""
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
-    
-    # Таблица игр
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS games (
-        chat_id INTEGER PRIMARY KEY,
-        creator_id INTEGER,
-        war_active BOOLEAN DEFAULT 0,
-        war_participants TEXT,
-        war_start_time TEXT,
-        last_war TEXT
-    )
-    ''')
-    
-    # Таблица игроков
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS players (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        username TEXT,
-        country TEXT,
-        money REAL DEFAULT 1000.0,
-        army_level INTEGER DEFAULT 1,
-        city_level INTEGER DEFAULT 1,
-        last_income TEXT,
-        wins INTEGER DEFAULT 0,
-        losses INTEGER DEFAULT 0,
-        chat_id INTEGER,
-        FOREIGN KEY (chat_id) REFERENCES games (chat_id),
-        UNIQUE(user_id, chat_id)
-    )
-    ''')
-    
-    # Индексы для ускорения поиска
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_user_id ON players(user_id)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_chat_id ON players(chat_id)')
-    
-    conn.commit()
-    conn.close()
+    async with aiosqlite.connect(DATABASE_FILE) as conn:
+        # Таблица игр
+        await conn.execute('''
+        CREATE TABLE IF NOT EXISTS games (
+            chat_id INTEGER PRIMARY KEY,
+            creator_id INTEGER,
+            war_active BOOLEAN DEFAULT 0,
+            war_participants TEXT,
+            war_start_time TEXT,
+            last_war TEXT
+        )
+        ''')
+        
+        # Таблица игроков
+        await conn.execute('''
+        CREATE TABLE IF NOT EXISTS players (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            username TEXT,
+            country TEXT,
+            money REAL DEFAULT 1000.0,
+            army_level INTEGER DEFAULT 1,
+            city_level INTEGER DEFAULT 1,
+            last_income TEXT,
+            wins INTEGER DEFAULT 0,
+            losses INTEGER DEFAULT 0,
+            chat_id INTEGER,
+            FOREIGN KEY (chat_id) REFERENCES games (chat_id),
+            UNIQUE(user_id, chat_id)
+        )
+        ''')
+        
+        # Индексы для ускорения поиска
+        await conn.execute('CREATE INDEX IF NOT EXISTS idx_user_id ON players(user_id)')
+        await conn.execute('CREATE INDEX IF NOT EXISTS idx_chat_id ON players(chat_id)')
+        
+        await conn.commit()
     print(f"✅ База данных инициализирована: {DATABASE_FILE}")
 
-def save_game(chat_id: int, creator_id: int, war_active: bool = False, 
-              war_participants: List[int] = None, war_start_time: Optional[datetime] = None,
-              last_war: Optional[datetime] = None):
+async def save_game(chat_id: int, creator_id: int, war_active: bool = False, 
+                   war_participants: List[int] = None, war_start_time: Optional[datetime] = None,
+                   last_war: Optional[datetime] = None):
     """Сохранить или обновить игру"""
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
-    
-    war_participants_str = json.dumps(war_participants) if war_participants else "[]"
-    war_start_time_str = war_start_time.isoformat() if war_start_time else None
-    last_war_str = last_war.isoformat() if last_war else None
-    
-    cursor.execute('''
-    INSERT OR REPLACE INTO games (chat_id, creator_id, war_active, war_participants, war_start_time, last_war)
-    VALUES (?, ?, ?, ?, ?, ?)
-    ''', (chat_id, creator_id, war_active, war_participants_str, war_start_time_str, last_war_str))
-    
-    conn.commit()
-    conn.close()
+    async with aiosqlite.connect(DATABASE_FILE) as conn:
+        war_participants_str = json.dumps(war_participants) if war_participants else "[]"
+        war_start_time_str = war_start_time.isoformat() if war_start_time else None
+        last_war_str = last_war.isoformat() if last_war else None
+        
+        await conn.execute('''
+        INSERT OR REPLACE INTO games (chat_id, creator_id, war_active, war_participants, war_start_time, last_war)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ''', (chat_id, creator_id, war_active, war_participants_str, war_start_time_str, last_war_str))
+        
+        await conn.commit()
 
-def save_player(player: Player, chat_id: int):
+async def save_player(player: Player, chat_id: int):
     """Сохранить или обновить игрока"""
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-    INSERT OR REPLACE INTO players 
-    (user_id, username, country, money, army_level, city_level, last_income, wins, losses, chat_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (
-        player.user_id, player.username, player.country, player.money,
-        player.army_level, player.city_level, player.last_income.isoformat(),
-        player.wins, player.losses, chat_id
-    ))
-    
-    conn.commit()
-    conn.close()
+    async with aiosqlite.connect(DATABASE_FILE) as conn:
+        await conn.execute('''
+        INSERT OR REPLACE INTO players 
+        (user_id, username, country, money, army_level, city_level, last_income, wins, losses, chat_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            player.user_id, player.username, player.country, player.money,
+            player.army_level, player.city_level, player.last_income.isoformat(),
+            player.wins, player.losses, chat_id
+        ))
+        
+        await conn.commit()
 
-def load_game(chat_id: int) -> Optional[Dict]:
+async def load_game(chat_id: int) -> Optional[Dict]:
     """Загрузить игру по chat_id"""
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
-    
-    cursor.execute('SELECT * FROM games WHERE chat_id = ?', (chat_id,))
-    game_data = cursor.fetchone()
-    
-    if not game_data:
-        conn.close()
-        return None
-    
-    # Преобразуем данные игры
-    game = {
-        "chat_id": game_data[0],
-        "creator_id": game_data[1],
-        "war_active": bool(game_data[2]),
-        "war_participants": json.loads(game_data[3]) if game_data[3] else [],
-        "war_start_time": datetime.fromisoformat(game_data[4]) if game_data[4] else None,
-        "last_war": datetime.fromisoformat(game_data[5]) if game_data[5] else None
-    }
-    
-    conn.close()
-    return game
+    async with aiosqlite.connect(DATABASE_FILE) as conn:
+        cursor = await conn.execute('SELECT * FROM games WHERE chat_id = ?', (chat_id,))
+        game_data = await cursor.fetchone()
+        
+        if not game_data:
+            return None
+        
+        # Преобразуем данные игры
+        game = {
+            "chat_id": game_data[0],
+            "creator_id": game_data[1],
+            "war_active": bool(game_data[2]),
+            "war_participants": json.loads(game_data[3]) if game_data[3] else [],
+            "war_start_time": datetime.fromisoformat(game_data[4]) if game_data[4] else None,
+            "last_war": datetime.fromisoformat(game_data[5]) if game_data[5] else None
+        }
+        
+        return game
 
-def load_player(user_id: int, chat_id: int) -> Optional[Player]:
+async def load_player(user_id: int, chat_id: int) -> Optional[Player]:
     """Загрузить игрока по user_id и chat_id"""
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-    SELECT * FROM players WHERE user_id = ? AND chat_id = ?
-    ''', (user_id, chat_id))
-    
-    player_data = cursor.fetchone()
-    conn.close()
-    
-    if not player_data:
-        return None
-    
-    # player_data: (id, user_id, username, country, money, army_level, city_level, last_income, wins, losses, chat_id)
-    return Player(
-        user_id=player_data[1],
-        username=player_data[2],
-        country=player_data[3],
-        money=player_data[4],
-        army_level=player_data[5],
-        city_level=player_data[6],
-        last_income=datetime.fromisoformat(player_data[7]),
-        wins=player_data[8],
-        losses=player_data[9]
-    )
-
-def load_all_players(chat_id: int) -> Dict[int, Player]:
-    """Загрузить всех игроков в игре"""
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
-    
-    cursor.execute('SELECT * FROM players WHERE chat_id = ?', (chat_id,))
-    players_data = cursor.fetchall()
-    conn.close()
-    
-    players = {}
-    for player_data in players_data:
-        player = Player(
+    async with aiosqlite.connect(DATABASE_FILE) as conn:
+        cursor = await conn.execute('''
+        SELECT * FROM players WHERE user_id = ? AND chat_id = ?
+        ''', (user_id, chat_id))
+        
+        player_data = await cursor.fetchone()
+        
+        if not player_data:
+            return None
+        
+        # player_data: (id, user_id, username, country, money, army_level, city_level, last_income, wins, losses, chat_id)
+        return Player(
             user_id=player_data[1],
             username=player_data[2],
             country=player_data[3],
@@ -230,77 +193,62 @@ def load_all_players(chat_id: int) -> Dict[int, Player]:
             wins=player_data[8],
             losses=player_data[9]
         )
-        players[player.user_id] = player
-    
-    return players
 
-def get_game_players_count(chat_id: int) -> int:
+async def load_all_players(chat_id: int) -> Dict[int, Player]:
+    """Загрузить всех игроков в игре"""
+    async with aiosqlite.connect(DATABASE_FILE) as conn:
+        cursor = await conn.execute('SELECT * FROM players WHERE chat_id = ?', (chat_id,))
+        players_data = await cursor.fetchall()
+        
+        players = {}
+        for player_data in players_data:
+            player = Player(
+                user_id=player_data[1],
+                username=player_data[2],
+                country=player_data[3],
+                money=player_data[4],
+                army_level=player_data[5],
+                city_level=player_data[6],
+                last_income=datetime.fromisoformat(player_data[7]),
+                wins=player_data[8],
+                losses=player_data[9]
+            )
+            players[player.user_id] = player
+        
+        return players
+
+async def get_game_players_count(chat_id: int) -> int:
     """Получить количество игроков в игре"""
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
-    
-    cursor.execute('SELECT COUNT(*) FROM players WHERE chat_id = ?', (chat_id,))
-    count = cursor.fetchone()[0]
-    conn.close()
-    
-    return count
+    async with aiosqlite.connect(DATABASE_FILE) as conn:
+        cursor = await conn.execute('SELECT COUNT(*) FROM players WHERE chat_id = ?', (chat_id,))
+        count = (await cursor.fetchone())[0]
+        return count
 
-def delete_game(chat_id: int):
+async def delete_game(chat_id: int):
     """Удалить игру и всех игроков"""
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
-    
-    cursor.execute('DELETE FROM players WHERE chat_id = ?', (chat_id,))
-    cursor.execute('DELETE FROM games WHERE chat_id = ?', (chat_id,))
-    
-    conn.commit()
-    conn.close()
+    async with aiosqlite.connect(DATABASE_FILE) as conn:
+        await conn.execute('DELETE FROM players WHERE chat_id = ?', (chat_id,))
+        await conn.execute('DELETE FROM games WHERE chat_id = ?', (chat_id,))
+        await conn.commit()
 
-def find_player_game(user_id: int) -> Tuple[Optional[int], Optional[Dict]]:
+async def find_player_game(user_id: int) -> Tuple[Optional[int], Optional[Dict]]:
     """Найти игру, в которой находится игрок"""
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
-    
-    cursor.execute('SELECT chat_id FROM players WHERE user_id = ? LIMIT 1', (user_id,))
-    result = cursor.fetchone()
-    
-    if not result:
-        conn.close()
-        return None, None
-    
-    chat_id = result[0]
-    
-    # Загружаем игру
-    cursor.execute('SELECT * FROM games WHERE chat_id = ?', (chat_id,))
-    game_data = cursor.fetchone()
-    
-    conn.close()
-    
-    if not game_data:
-        return chat_id, None
-    
-    game = {
-        "chat_id": game_data[0],
-        "creator_id": game_data[1],
-        "war_active": bool(game_data[2]),
-        "war_participants": json.loads(game_data[3]) if game_data[3] else [],
-        "war_start_time": datetime.fromisoformat(game_data[4]) if game_data[4] else None,
-        "last_war": datetime.fromisoformat(game_data[5]) if game_data[5] else None
-    }
-    
-    return chat_id, game
-
-def get_all_games() -> Dict[int, Dict]:
-    """Получить все активные игры"""
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
-    
-    cursor.execute('SELECT * FROM games')
-    games_data = cursor.fetchall()
-    conn.close()
-    
-    games = {}
-    for game_data in games_data:
+    async with aiosqlite.connect(DATABASE_FILE) as conn:
+        cursor = await conn.execute('SELECT chat_id FROM players WHERE user_id = ? LIMIT 1', (user_id,))
+        result = await cursor.fetchone()
+        
+        if not result:
+            return None, None
+        
+        chat_id = result[0]
+        
+        # Загружаем игру
+        cursor = await conn.execute('SELECT * FROM games WHERE chat_id = ?', (chat_id,))
+        game_data = await cursor.fetchone()
+        
+        if not game_data:
+            return chat_id, None
+        
         game = {
             "chat_id": game_data[0],
             "creator_id": game_data[1],
@@ -309,64 +257,189 @@ def get_all_games() -> Dict[int, Dict]:
             "war_start_time": datetime.fromisoformat(game_data[4]) if game_data[4] else None,
             "last_war": datetime.fromisoformat(game_data[5]) if game_data[5] else None
         }
-        games[game["chat_id"]] = game
-    
-    return games
+        
+        return chat_id, game
 
-async def update_income():
-    """Обновление пассивного дохода"""
-    while True:
-        await asyncio.sleep(1)  # Проверяем каждую секунду
-        current_time = datetime.now()
+async def get_all_games() -> Dict[int, Dict]:
+    """Получить все активные игры"""
+    async with aiosqlite.connect(DATABASE_FILE) as conn:
+        cursor = await conn.execute('SELECT * FROM games')
+        games_data = await cursor.fetchall()
         
-        # Получаем все активные игры
-        games = get_all_games()
+        games = {}
+        for game_data in games_data:
+            game = {
+                "chat_id": game_data[0],
+                "creator_id": game_data[1],
+                "war_active": bool(game_data[2]),
+                "war_participants": json.loads(game_data[3]) if game_data[3] else [],
+                "war_start_time": datetime.fromisoformat(game_data[4]) if game_data[4] else None,
+                "last_war": datetime.fromisoformat(game_data[5]) if game_data[5] else None
+            }
+            games[game["chat_id"]] = game
         
-        for chat_id, game in games.items():
-            if game["war_active"]:
-                continue  # Пропускаем игры с активной войной
+        return games
+
+async def update_player_income_in_db(user_id: int, chat_id: int) -> float:
+    """Обновить доход конкретного игрока и вернуть начисленную сумму"""
+    try:
+        async with aiosqlite.connect(DATABASE_FILE) as conn:
+            # Загружаем игрока
+            cursor = await conn.execute('''
+            SELECT * FROM players WHERE user_id = ? AND chat_id = ?
+            ''', (user_id, chat_id))
             
-            # Загружаем всех игроков в этой игре
-            players = load_all_players(chat_id)
+            player_data = await cursor.fetchone()
             
-            for player in players.values():
-                # Вычисляем разницу во времени
-                time_diff = (current_time - player.last_income).total_seconds()
-                
-                if time_diff > 0:  # Если прошло больше 0 секунд
-                    country = COUNTRIES.get(player.country)
-                    if country:
-                        # Рассчитываем доход
-                        income = country.base_income * player.city_level * time_diff
-                        
+            if not player_data:
+                print(f"❌ Игрок {user_id} не найден в чате {chat_id}")
+                return 0
+            
+            player = Player(
+                user_id=player_data[1],
+                username=player_data[2],
+                country=player_data[3],
+                money=player_data[4],
+                army_level=player_data[5],
+                city_level=player_data[6],
+                last_income=datetime.fromisoformat(player_data[7]),
+                wins=player_data[8],
+                losses=player_data[9]
+            )
+            
+            current_time = datetime.now()
+            time_diff = (current_time - player.last_income).total_seconds()
+            
+            print(f"🔍 Отладка для игрока {player.username} (ID: {user_id}):")
+            print(f"   Время последнего дохода: {player.last_income}")
+            print(f"   Текущее время: {current_time}")
+            print(f"   Разница: {time_diff:.1f} секунд")
+            print(f"   Текущие деньги: {player.money}")
+            print(f"   Страна: {player.country}")
+            print(f"   Уровень города: {player.city_level}")
+            
+            if time_diff > 0:
+                country = COUNTRIES.get(player.country)
+                if country:
+                    # Рассчитываем доход
+                    income = country.base_income * player.city_level * time_diff
+                    income = round(income, 2)  # Округляем до 2 знаков
+                    
+                    print(f"   Базовая ставка: {country.base_income}/сек")
+                    print(f"   Рассчитанный доход: {income:.2f} монет")
+                    
+                    if income > 0:
                         # Обновляем деньги игрока
                         player.money += income
                         player.last_income = current_time
                         
-                        # Сохраняем обновленного игрока в базу данных
-                        save_player(player, chat_id)
+                        # Сохраняем обновленного игрока
+                        await conn.execute('''
+                        UPDATE players 
+                        SET money = ?, last_income = ? 
+                        WHERE user_id = ? AND chat_id = ?
+                        ''', (player.money, player.last_income.isoformat(), user_id, chat_id))
                         
-                        # Логирование для отладки
-                        # print(f"💰 Игрок {player.username} получил {income:.2f} монет")
+                        await conn.commit()
+                        
+                        print(f"💰 Игрок {player.username} получил {income:.2f} монет")
+                        print(f"   Новый баланс: {player.money:.2f}")
+                        return income
+                    else:
+                        print(f"⚠️ Рассчитанный доход 0 или меньше для {player.username}")
+                else:
+                    print(f"❌ Страна {player.country} не найдена в COUNTRIES")
+            else:
+                print(f"⚠️ Время не изменилось для {player.username}")
+            
+            return 0
+    except Exception as e:
+        print(f"❌ Ошибка при обновлении дохода для {user_id}: {e}")
+        return 0
 
-async def update_player_income_in_db(user_id: int, chat_id: int):
-    """Обновить доход конкретного игрока"""
-    player = load_player(user_id, chat_id)
-    if not player:
-        return
+async def update_all_players_income_in_chat(chat_id: int):
+    """Обновить доход всех игроков в чате"""
+    try:
+        async with aiosqlite.connect(DATABASE_FILE) as conn:
+            # Проверяем, есть ли активная война
+            cursor = await conn.execute('SELECT war_active FROM games WHERE chat_id = ?', (chat_id,))
+            game_data = await cursor.fetchone()
+            
+            if game_data and bool(game_data[0]):  # Если идет война
+                print(f"⚔️ Пропускаем чат {chat_id} - идет война")
+                return
+            
+            # Загружаем всех игроков
+            cursor = await conn.execute('SELECT * FROM players WHERE chat_id = ?', (chat_id,))
+            players_data = await cursor.fetchall()
+            
+            if not players_data:
+                print(f"⚠️ В чате {chat_id} нет игроков")
+                return
+            
+            current_time = datetime.now()
+            total_income = 0
+            
+            print(f"🔍 Обновление дохода в чате {chat_id} для {len(players_data)} игроков")
+            
+            for player_data in players_data:
+                player = Player(
+                    user_id=player_data[1],
+                    username=player_data[2],
+                    country=player_data[3],
+                    money=player_data[4],
+                    army_level=player_data[5],
+                    city_level=player_data[6],
+                    last_income=datetime.fromisoformat(player_data[7]),
+                    wins=player_data[8],
+                    losses=player_data[9]
+                )
+                
+                time_diff = (current_time - player.last_income).total_seconds()
+                
+                if time_diff > 0:
+                    country = COUNTRIES.get(player.country)
+                    if country:
+                        # Рассчитываем доход
+                        income = country.base_income * player.city_level * time_diff
+                        income = round(income, 2)
+                        total_income += income
+                        
+                        if income > 0:
+                            print(f"   {player.username}: +{income:.2f} монет ({time_diff:.1f} сек)")
+                            
+                            # Обновляем игрока в базе
+                            new_money = player.money + income
+                            await conn.execute('''
+                            UPDATE players 
+                            SET money = ?, last_income = ? 
+                            WHERE user_id = ? AND chat_id = ?
+                            ''', (new_money, current_time.isoformat(), player.user_id, chat_id))
+            
+            await conn.commit()
+            
+            if total_income > 0:
+                print(f"💰 В чате {chat_id} начислено {total_income:.2f} монет")
+            else:
+                print(f"ℹ️ В чате {chat_id} не было начислений")
+                
+    except Exception as e:
+        print(f"❌ Ошибка при обновлении дохода в чате {chat_id}: {e}")
+
+async def force_update_all_incomes():
+    """Принудительное обновление дохода для всех игроков"""
+    print("🔄 Принудительное обновление дохода для всех игроков...")
     
-    current_time = datetime.now()
-    time_diff = (current_time - player.last_income).total_seconds()
+    # Получаем все активные игры
+    games = await get_all_games()
     
-    if time_diff > 0:
-        country = COUNTRIES.get(player.country)
-        if country:
-            income = country.base_income * player.city_level * time_diff
-            player.money += income
-            player.last_income = current_time
-            save_player(player, chat_id)
-            return income
-    return 0
+    for chat_id, game in games.items():
+        if not game["war_active"]:  # Если нет активной войны
+            await update_all_players_income_in_chat(chat_id)
+    
+    print("✅ Доход обновлен для всех игроков")
+
+# ========== ОСНОВНЫЕ ФУНКЦИИ БОТА ==========
 
 def get_game_keyboard(player_id: int) -> InlineKeyboardBuilder:
     """Клавиатура для игрока"""
@@ -391,10 +464,10 @@ def get_countries_keyboard() -> InlineKeyboardBuilder:
     builder.adjust(2)
     return builder
 
-def get_players_keyboard(chat_id: int, exclude_id: int, action: str) -> InlineKeyboardBuilder:
+async def get_players_keyboard(chat_id: int, exclude_id: int, action: str) -> InlineKeyboardBuilder:
     """Клавиатура выбора игрока для передачи"""
     builder = InlineKeyboardBuilder()
-    players = load_all_players(chat_id)
+    players = await load_all_players(chat_id)
     
     for player_id, player in players.items():
         if player_id != exclude_id:
@@ -408,10 +481,10 @@ def get_players_keyboard(chat_id: int, exclude_id: int, action: str) -> InlineKe
     builder.adjust(1)
     return builder
 
-def get_war_targets_keyboard(chat_id: int, attacker_id: int) -> InlineKeyboardBuilder:
+async def get_war_targets_keyboard(chat_id: int, attacker_id: int) -> InlineKeyboardBuilder:
     """Клавиатура выбора цели для войны"""
     builder = InlineKeyboardBuilder()
-    players = load_all_players(chat_id)
+    players = await load_all_players(chat_id)
     
     for player_id, player in players.items():
         if player_id != attacker_id:
@@ -467,6 +540,8 @@ async def send_war_image(chat_id: int, attacker_country: Country, target_country
     except Exception as e:
         print(f"⚠️ Ошибка при отправке изображения войны: {e}")
 
+# ========== ОБРАБОТЧИКИ КОМАНД ==========
+
 async def handle_start(message: Message):
     """Обработка команды /start"""
     if message.chat.type == "private":
@@ -483,9 +558,12 @@ async def handle_game(message: Message):
         return
     
     chat_id = message.chat.id
+    user_id = message.from_user.id
+    
+    print(f"🎮 Команда /game от {message.from_user.username} (ID: {user_id}) в чате {chat_id}")
     
     # Проверяем, есть ли уже игра
-    existing_game = load_game(chat_id)
+    existing_game = await load_game(chat_id)
     
     if existing_game and existing_game["war_active"]:
         await message.answer("⚔️ Сейчас идет война! Подождите ее окончания.")
@@ -493,14 +571,17 @@ async def handle_game(message: Message):
     
     if not existing_game:
         # Создание новой игры
-        save_game(chat_id, message.from_user.id)
+        await save_game(chat_id, message.from_user.id)
         await message.answer("🎮 Игра создана! Чтобы присоединиться, нажмите /join")
     else:
         # Проверка, участвует ли уже пользователь
-        player = load_player(message.from_user.id, chat_id)
+        player = await load_player(user_id, chat_id)
         if player:
-            # Обновляем доход перед показом меню
-            await update_player_income_in_db(player.user_id, chat_id)
+            print(f"👤 Игрок {player.username} уже в игре, обновляем меню")
+            # ПРИНУДИТЕЛЬНО обновляем доход перед показом меню
+            income = await update_player_income_in_db(user_id, chat_id)
+            if income > 0:
+                await message.answer(f"💰 Вы получили {income:.2f} монет пассивного дохода!")
             await show_player_menu(message, player)
             return
         
@@ -515,7 +596,9 @@ async def handle_join(message: Message):
     chat_id = message.chat.id
     user_id = message.from_user.id
     
-    game = load_game(chat_id)
+    print(f"👤 Команда /join от {message.from_user.username} (ID: {user_id}) в чате {chat_id}")
+    
+    game = await load_game(chat_id)
     if not game:
         await message.answer("❌ Игра не создана! Сначала создайте игру с помощью /game")
         return
@@ -526,10 +609,13 @@ async def handle_join(message: Message):
         return
     
     # Проверка, участвует ли уже пользователь
-    player = load_player(user_id, chat_id)
+    player = await load_player(user_id, chat_id)
     if player:
-        # Обновляем доход перед показом меню
-        await update_player_income_in_db(player.user_id, chat_id)
+        print(f"👤 Игрок {player.username} уже в игре")
+        # ПРИНУДИТЕЛЬНО обновляем доход перед показом меню
+        income = await update_player_income_in_db(user_id, chat_id)
+        if income > 0:
+            await message.answer(f"💰 Вы получили {income:.2f} монет пассивного дохода!")
         await message.answer("✅ Вы уже в игре!")
         await show_player_menu(message, player)
         return
@@ -546,11 +632,13 @@ async def handle_country_selection(callback: CallbackQuery):
     user_id = callback.from_user.id
     chat_id = callback.message.chat.id
     
+    print(f"🌍 Выбор страны от {callback.from_user.username} (ID: {user_id})")
+    
     # Проверяем, есть ли игра в этом чате
-    game = load_game(chat_id)
+    game = await load_game(chat_id)
     if not game:
         # Ищем игру, где есть пользователь
-        found_chat_id, found_game = find_player_game(user_id)
+        found_chat_id, found_game = await find_player_game(user_id)
         if found_game:
             chat_id = found_chat_id
             game = found_game
@@ -565,19 +653,19 @@ async def handle_country_selection(callback: CallbackQuery):
         return
     
     # Проверка, не выбрана ли страна другим игроком в этой игре
-    players = load_all_players(chat_id)
+    players = await load_all_players(chat_id)
     for player in players.values():
         if player.country == country_id and player.user_id != user_id:
             await callback.answer("❌ Эта страна уже занята!")
             return
     
     # Создание игрока или обновление страны
-    existing_player = load_player(user_id, chat_id)
+    existing_player = await load_player(user_id, chat_id)
     
     if existing_player:
         # Смена страны существующего игрока
         existing_player.country = country_id
-        save_player(existing_player, chat_id)
+        await save_player(existing_player, chat_id)
         action_text = "сменили страну на"
         player = existing_player
     else:
@@ -588,10 +676,12 @@ async def handle_country_selection(callback: CallbackQuery):
             country=country_id,
             last_income=datetime.now()  # Устанавливаем текущее время
         )
-        save_player(player, chat_id)
+        await save_player(player, chat_id)
         action_text = "присоединились к игре как"
     
     country = COUNTRIES[country_id]
+    print(f"✅ Игрок {player.username} выбрал страну {country.name}")
+    
     await callback.message.edit_text(
         f"✅ Вы {action_text} {country.emoji} {country.name}!\n\n"
         f"💰 Начальный капитал: {int(player.money)}\n"
@@ -604,20 +694,25 @@ async def handle_country_selection(callback: CallbackQuery):
 
 async def update_player_menu(message: Message, player: Player):
     """Обновить меню игрока"""
-    chat_id, game = find_player_game(player.user_id)
+    chat_id, game = await find_player_game(player.user_id)
     if not game or not chat_id:
+        print(f"❌ Игра не найдена для игрока {player.username}")
         return
     
-    # Обновляем доход перед показом меню
+    print(f"🔄 Обновление меню для {player.username} (ID: {player.user_id})")
+    
+    # ПРИНУДИТЕЛЬНО обновляем доход перед показом меню
     income = await update_player_income_in_db(player.user_id, chat_id)
     
     # Загружаем обновленного игрока
-    updated_player = load_player(player.user_id, chat_id)
+    updated_player = await load_player(player.user_id, chat_id)
     if not updated_player:
+        print(f"❌ Не удалось загрузить игрока {player.username}")
         return
     
     country = COUNTRIES.get(updated_player.country)
     if not country:
+        print(f"❌ Страна не найдена для игрока {player.username}")
         return
     
     # Расчет дохода
@@ -637,35 +732,43 @@ async def update_player_menu(message: Message, player: Player):
         f"🏙️ Улучшить город ({city_upgrade_cost}💰)"
     )
     
+    if income > 0:
+        text = f"💰 Вы получили {income:.2f} монет!\n\n" + text
+        print(f"✅ В меню добавлено уведомление о доходе: {income:.2f} монет")
+    
     builder = get_game_keyboard(updated_player.user_id)
     
     # Пытаемся редактировать сообщение
     try:
         await message.edit_text(text, reply_markup=builder.as_markup())
-    except TelegramBadRequest:
+    except TelegramBadRequest as e:
+        print(f"⚠️ Не удалось редактировать сообщение: {e}")
         # Если сообщение нельзя редактировать, отправляем новое
         await message.answer(text, reply_markup=builder.as_markup())
 
 async def show_player_menu(message: Message, player: Optional[Player] = None):
     """Показать меню игрока"""
     user_id = message.from_user.id
-    chat_id, game = find_player_game(user_id)
+    chat_id, game = await find_player_game(user_id)
     
     if not game or not chat_id:
         await message.answer("❌ Вы не в игре! Используйте /join")
         return
     
+    print(f"📱 Показ меню для пользователя {user_id} в чате {chat_id}")
+    
     if not player:
-        player = load_player(user_id, chat_id)
+        player = await load_player(user_id, chat_id)
         if not player:
             await message.answer("❌ Вы не в игре! Используйте /join")
             return
     
-    # Обновляем доход перед показом меню
-    await update_player_income_in_db(user_id, chat_id)
+    # ПРИНУДИТЕЛЬНО обновляем доход перед показом меню
+    income = await update_player_income_in_db(user_id, chat_id)
+    print(f"💰 Начислен доход для {player.username}: {income:.2f} монет")
     
     # Загружаем обновленного игрока
-    updated_player = load_player(user_id, chat_id)
+    updated_player = await load_player(user_id, chat_id)
     if not updated_player:
         await message.answer("❌ Ошибка загрузки данных!")
         return
@@ -680,22 +783,25 @@ async def handle_stats(callback: CallbackQuery):
         return
     
     target_player_id = int(data[1])
+    user_id = callback.from_user.id
     
-    if target_player_id != callback.from_user.id:
+    if target_player_id != user_id:
         await callback.answer("❌ Это не ваша кнопка!")
         return
     
-    user_id = callback.from_user.id
-    chat_id, game = find_player_game(user_id)
+    print(f"📊 Статистика запрошена пользователем {user_id}")
+    
+    chat_id, game = await find_player_game(user_id)
     
     if not game or not chat_id:
         await callback.answer("❌ Вы не в игре!")
         return
     
-    # Обновляем доход перед показом статистики
-    await update_player_income_in_db(user_id, chat_id)
+    # ПРИНУДИТЕЛЬНО обновляем доход перед показом статистики
+    income = await update_player_income_in_db(user_id, chat_id)
+    print(f"💰 При статистике начислен доход: {income:.2f} монет")
     
-    player = load_player(user_id, chat_id)
+    player = await load_player(user_id, chat_id)
     if not player:
         await callback.answer("❌ Вы не в игре!")
         return
@@ -721,6 +827,9 @@ async def handle_stats(callback: CallbackQuery):
         f"🏆 Победы/Поражения: {player.wins}/{player.losses}"
     )
     
+    if income > 0:
+        text = f"💰 Вы получили {income:.2f} монет!\n\n" + text
+    
     await callback.message.edit_text(text)
     await callback.answer()
 
@@ -732,27 +841,30 @@ async def handle_upgrade_army(callback: CallbackQuery):
         return
     
     target_player_id = int(data[2])
+    user_id = callback.from_user.id
     
-    if target_player_id != callback.from_user.id:
+    if target_player_id != user_id:
         await callback.answer("❌ Это не ваша кнопка!")
         return
     
-    user_id = callback.from_user.id
-    chat_id, game = find_player_game(user_id)
+    print(f"⚔️ Улучшение армии запрошено пользователем {user_id}")
+    
+    chat_id, game = await find_player_game(user_id)
     
     if not game or not chat_id:
         await callback.answer("❌ Вы не в игре!")
         return
-    
-    # Обновляем доход перед улучшением
-    await update_player_income_in_db(user_id, chat_id)
     
     # Проверка на активную войну
     if game["war_active"]:
         await callback.answer("⚔️ Во время войны нельзя улучшать армию!")
         return
     
-    player = load_player(user_id, chat_id)
+    # ПРИНУДИТЕЛЬНО обновляем доход перед улучшением
+    income = await update_player_income_in_db(user_id, chat_id)
+    print(f"💰 При улучшении армии начислен доход: {income:.2f} монет")
+    
+    player = await load_player(user_id, chat_id)
     if not player:
         await callback.answer("❌ Вы не в игре!")
         return
@@ -767,7 +879,7 @@ async def handle_upgrade_army(callback: CallbackQuery):
     if player.money >= upgrade_cost:
         player.money -= upgrade_cost
         player.army_level += 1
-        save_player(player, chat_id)
+        await save_player(player, chat_id)
         
         await callback.answer(f"✅ Армия улучшена до уровня {player.army_level}!")
         await update_player_menu(callback.message, player)
@@ -782,27 +894,30 @@ async def handle_upgrade_city(callback: CallbackQuery):
         return
     
     target_player_id = int(data[2])
+    user_id = callback.from_user.id
     
-    if target_player_id != callback.from_user.id:
+    if target_player_id != user_id:
         await callback.answer("❌ Это не ваша кнопка!")
         return
     
-    user_id = callback.from_user.id
-    chat_id, game = find_player_game(user_id)
+    print(f"🏙️ Улучшение города запрошено пользователем {user_id}")
+    
+    chat_id, game = await find_player_game(user_id)
     
     if not game or not chat_id:
         await callback.answer("❌ Вы не в игре!")
         return
-    
-    # Обновляем доход перед улучшением
-    await update_player_income_in_db(user_id, chat_id)
     
     # Проверка на активную войну
     if game["war_active"]:
         await callback.answer("⚔️ Во время войны нельзя улучшать город!")
         return
     
-    player = load_player(user_id, chat_id)
+    # ПРИНУДИТЕЛЬНО обновляем доход перед улучшением
+    income = await update_player_income_in_db(user_id, chat_id)
+    print(f"💰 При улучшении города начислен доход: {income:.2f} монет")
+    
+    player = await load_player(user_id, chat_id)
     if not player:
         await callback.answer("❌ Вы не в игре!")
         return
@@ -817,7 +932,7 @@ async def handle_upgrade_city(callback: CallbackQuery):
     if player.money >= upgrade_cost:
         player.money -= upgrade_cost
         player.city_level += 1
-        save_player(player, chat_id)
+        await save_player(player, chat_id)
         
         await callback.answer(f"✅ Город улучшен до уровня {player.city_level}!")
         await update_player_menu(callback.message, player)
@@ -832,35 +947,77 @@ async def handle_top(callback: CallbackQuery):
         return
     
     target_player_id = int(data[1])
+    user_id = callback.from_user.id
     
-    if target_player_id != callback.from_user.id:
+    if target_player_id != user_id:
         await callback.answer("❌ Это не ваша кнопка!")
         return
     
-    user_id = callback.from_user.id
-    chat_id, game = find_player_game(user_id)
+    print(f"🌍 Топ игроков запрошен пользователем {user_id}")
+    
+    chat_id, game = await find_player_game(user_id)
     
     if not game or not chat_id:
-        await callback.answer("❌ Игра не найдена!")
+        await callback.answer("❌ Вы не в игре!")
         return
     
-    # Загружаем всех игроков
-    players = load_all_players(chat_id)
+    # Обновляем доход для всех игроков в чате
+    await update_all_players_income_in_chat(chat_id)
     
-    # Сортировка игроков по деньгам
-    sorted_players = sorted(
-        players.values(),
-        key=lambda p: p.money,
-        reverse=True
-    )
+    players = await load_all_players(chat_id)
     
-    text = "🏆 Топ игроков:\n\n"
+    if len(players) < 2:
+        await callback.message.edit_text("⚠️ Для топа нужно как минимум 2 игрока!")
+        return
+    
+    # Сортируем игроков по деньгам
+    sorted_players = sorted(players.values(), key=lambda p: p.money, reverse=True)
+    
+    top_text = "🏆 Топ игроков:\n\n"
     for i, player in enumerate(sorted_players[:10], 1):
-        country = COUNTRIES.get(player.country, COUNTRIES["russia"])
-        text += f"{i}. {country.emoji} {player.username}: {int(player.money)}💰 (⚔{player.army_level} 🏙{player.city_level})\n"
+        country = COUNTRIES.get(player.country, Country("Неизвестно", "❓", 0))
+        top_text += f"{i}. {country.emoji} {player.username}: {int(player.money)}💰 (⚔️{player.army_level} 🏙️{player.city_level})\n"
     
-    await callback.message.edit_text(text)
+    await callback.message.edit_text(top_text)
     await callback.answer()
+
+async def handle_refresh(callback: CallbackQuery):
+    """Обработка обновления данных"""
+    data = callback.data.split('_')
+    if len(data) != 2:
+        await callback.answer("❌ Ошибка!")
+        return
+    
+    target_player_id = int(data[1])
+    user_id = callback.from_user.id
+    
+    if target_player_id != user_id:
+        await callback.answer("❌ Это не ваша кнопка!")
+        return
+    
+    print(f"🔄 Обновление данных запрошено пользователем {user_id}")
+    
+    chat_id, game = await find_player_game(user_id)
+    
+    if not game or not chat_id:
+        await callback.answer("❌ Вы не в игре!")
+        return
+    
+    # ПРИНУДИТЕЛЬНО обновляем доход перед обновлением
+    income = await update_player_income_in_db(user_id, chat_id)
+    print(f"💰 При обновлении начислен доход: {income:.2f} монет")
+    
+    player = await load_player(user_id, chat_id)
+    if not player:
+        await callback.answer("❌ Вы не в игре!")
+        return
+    
+    await update_player_menu(callback.message, player)
+    
+    if income > 0:
+        await callback.answer(f"✅ Данные обновлены! Вы получили {income:.2f} монет")
+    else:
+        await callback.answer("✅ Данные обновлены!")
 
 async def handle_change_country(callback: CallbackQuery):
     """Обработка смены страны"""
@@ -870,13 +1027,15 @@ async def handle_change_country(callback: CallbackQuery):
         return
     
     target_player_id = int(data[2])
+    user_id = callback.from_user.id
     
-    if target_player_id != callback.from_user.id:
+    if target_player_id != user_id:
         await callback.answer("❌ Это не ваша кнопка!")
         return
     
-    user_id = callback.from_user.id
-    chat_id, game = find_player_game(user_id)
+    print(f"🔄 Смена страны запрошена пользователем {user_id}")
+    
+    chat_id, game = await find_player_game(user_id)
     
     if not game or not chat_id:
         await callback.answer("❌ Вы не в игре!")
@@ -887,28 +1046,239 @@ async def handle_change_country(callback: CallbackQuery):
         await callback.answer("⚔️ Во время войны нельзя менять страну!")
         return
     
-    player = load_player(user_id, chat_id)
-    if not player:
-        await callback.answer("❌ Вы не в игре!")
-        return
+    # ПРИНУДИТЕЛЬНО обновляем доход перед сменой страны
+    income = await update_player_income_in_db(user_id, chat_id)
+    print(f"💰 При смене страны начислен доход: {income:.2f} монет")
     
-    # Стоимость смены страны - 10% от текущих денег
-    change_cost = int(player.money * 0.1)
-    
-    if player.money < change_cost:
-        await callback.answer(f"❌ Для смены страны нужно {change_cost}💰!")
-        return
-    
+    # Показываем клавиатуру выбора страны
     builder = get_countries_keyboard()
-    builder.button(text="❌ Отмена", callback_data=f"cancel_{user_id}")
-    builder.adjust(2, 1)
+    text = "🌍 Выберите новую страну:"
+    
+    if income > 0:
+        text = f"💰 Вы получили {income:.2f} монет!\n\n" + text
     
     await callback.message.edit_text(
-        f"🌍 Выберите новую страну:\n"
-        f"💸 Стоимость смены: {change_cost}💰",
+        text,
         reply_markup=builder.as_markup()
     )
     await callback.answer()
+
+async def handle_start_war(callback: CallbackQuery):
+    """Обработка начала войны"""
+    data = callback.data.split('_')
+    if len(data) != 3:
+        await callback.answer("❌ Ошибка!")
+        return
+    
+    target_player_id = int(data[2])
+    user_id = callback.from_user.id
+    
+    if target_player_id != user_id:
+        await callback.answer("❌ Это не ваша кнопка!")
+        return
+    
+    print(f"⚔️ Начало войны запрошено пользователем {user_id}")
+    
+    chat_id, game = await find_player_game(user_id)
+    
+    if not game or not chat_id:
+        await callback.answer("❌ Вы не в игре!")
+        return
+    
+    # Проверяем, не идет ли уже война
+    if game["war_active"]:
+        await callback.answer("⚔️ Война уже идет! Подождите ее окончания.")
+        return
+    
+    # Проверяем время с последней войны
+    if game.get("last_war"):
+        time_since_last_war = datetime.now() - game["last_war"]
+        if time_since_last_war < timedelta(minutes=1):
+            wait_time = 60 - int(time_since_last_war.total_seconds())
+            await callback.answer(f"⏳ Следующая война возможна через {wait_time} секунд!")
+            return
+    
+    # Проверяем количество игроков
+    players_count = await get_game_players_count(chat_id)
+    if players_count < 2:
+        await callback.answer("⚠️ Для войны нужно как минимум 2 игрока!")
+        return
+    
+    # ПРИНУДИТЕЛЬНО обновляем доход перед началом войны
+    income = await update_player_income_in_db(user_id, chat_id)
+    print(f"💰 При начале войны начислен доход: {income:.2f} монет")
+    
+    # Показываем выбор цели
+    builder = await get_war_targets_keyboard(chat_id, user_id)
+    text = "🎯 Выберите цель для атаки:"
+    
+    if income > 0:
+        text = f"💰 Вы получили {income:.2f} монет!\n\n" + text
+    
+    await callback.message.edit_text(
+        text,
+        reply_markup=builder.as_markup()
+    )
+    await callback.answer()
+
+async def handle_war_target(callback: CallbackQuery):
+    """Обработка выбора цели для войны"""
+    data = callback.data.split('_')
+    if len(data) != 2:
+        await callback.answer("❌ Ошибка!")
+        return
+    
+    target_id = int(data[1])
+    attacker_id = callback.from_user.id
+    
+    if attacker_id == target_id:
+        await callback.answer("❌ Нельзя атаковать самого себя!")
+        return
+    
+    print(f"🎯 Выбор цели войны: {attacker_id} -> {target_id}")
+    
+    chat_id, game = await find_player_game(attacker_id)
+    
+    if not game or not chat_id:
+        await callback.answer("❌ Игра не найдена!")
+        return
+    
+    # Проверяем, не идет ли уже война
+    if game["war_active"]:
+        await callback.answer("⚔️ Война уже идет!")
+        return
+    
+    # Загружаем игроков
+    attacker = await load_player(attacker_id, chat_id)
+    target = await load_player(target_id, chat_id)
+    
+    if not attacker or not target:
+        await callback.answer("❌ Игрок не найден!")
+        return
+    
+    attacker_country = COUNTRIES.get(attacker.country)
+    target_country = COUNTRIES.get(target.country)
+    
+    if not attacker_country or not target_country:
+        await callback.answer("❌ Ошибка данных страны!")
+        return
+    
+    # ПРИНУДИТЕЛЬНО обновляем доход обоих игроков перед войной
+    print(f"💰 Обновляем доход для атакующего {attacker.username}")
+    income_attacker = await update_player_income_in_db(attacker_id, chat_id)
+    
+    print(f"💰 Обновляем доход для цели {target.username}")
+    income_target = await update_player_income_in_db(target_id, chat_id)
+    
+    # Перезагружаем обновленных игроков
+    attacker = await load_player(attacker_id, chat_id)
+    target = await load_player(target_id, chat_id)
+    
+    # Начинаем войну
+    war_start_time = datetime.now()
+    game["war_active"] = True
+    game["war_participants"] = [attacker_id, target_id]
+    game["war_start_time"] = war_start_time
+    
+    await save_game(chat_id, game["creator_id"], True, [attacker_id, target_id], war_start_time, game.get("last_war"))
+    
+    # Отправляем изображение войны
+    await send_war_image(chat_id, attacker_country, target_country)
+    
+    # Объявляем войну
+    war_message = await callback.message.answer(
+        f"⚔️ ВОЙНА НАЧАЛАСЬ! ⚔️\n\n"
+        f"{attacker_country.emoji} {attacker.username} атакует {target_country.emoji} {target.username}!\n"
+        f"Битва продлится 30 секунд...\n\n"
+        f"Атакующий: ⚔️{attacker.army_level} 💰{int(attacker.money)}\n"
+        f"Защитник: ⚔️{target.army_level} 💰{int(target.money)}"
+    )
+    
+    # Запускаем отсчет времени
+    await asyncio.sleep(30)
+    
+    # Завершаем войну
+    await finish_war(chat_id, attacker, target, war_message)
+
+async def finish_war(chat_id: int, attacker: Player, target: Player, war_message: Message):
+    """Завершить войну"""
+    # Перезагружаем данные игроков (на случай, если они обновились)
+    attacker = await load_player(attacker.user_id, chat_id)
+    target = await load_player(target.user_id, chat_id)
+    
+    if not attacker or not target:
+        print(f"❌ Ошибка при завершении войны: игроки не найдены")
+        return
+    
+    attacker_country = COUNTRIES.get(attacker.country)
+    target_country = COUNTRIES.get(target.country)
+    
+    if not attacker_country or not target_country:
+        print(f"❌ Ошибка при завершении войны: страны не найдены")
+        return
+    
+    # Рассчитываем шансы на победу
+    attacker_power = attacker.army_level * (1 + attacker.money / 10000)
+    target_power = target.army_level * (1 + target.money / 10000)
+    
+    total_power = attacker_power + target_power
+    attacker_win_chance = attacker_power / total_power
+    
+    # Определяем победителя
+    if random.random() < attacker_win_chance:
+        winner = attacker
+        loser = target
+        winner_country = attacker_country
+        loser_country = target_country
+    else:
+        winner = target
+        loser = attacker
+        winner_country = target_country
+        loser_country = attacker_country
+    
+    # Рассчитываем трофеи (10% от денег проигравшего)
+    trophy = int(loser.money * 0.1)
+    
+    # Обновляем статистику
+    winner.wins += 1
+    loser.losses += 1
+    
+    # Передаем трофеи
+    winner.money += trophy
+    loser.money -= trophy
+    
+    # Гарантируем, что у проигравшего останется минимум 100 монет
+    if loser.money < 100:
+        loser.money = 100
+    
+    # Сохраняем изменения
+    await save_player(winner, chat_id)
+    await save_player(loser, chat_id)
+    
+    # Обновляем данные игры
+    game = await load_game(chat_id)
+    if game:
+        game["war_active"] = False
+        game["war_participants"] = []
+        game["last_war"] = datetime.now()
+        await save_game(chat_id, game["creator_id"], False, [], None, game["last_war"])
+    
+    # Отправляем результат
+    result_text = (
+        f"🏁 ВОЙНА ЗАВЕРШЕНА! 🏁\n\n"
+        f"🏆 ПОБЕДИТЕЛЬ: {winner_country.emoji} {winner.username}\n"
+        f"💀 ПРОИГРАВШИЙ: {loser_country.emoji} {loser.username}\n\n"
+        f"💰 Трофеи: {trophy} монет\n"
+        f"📊 Шансы на победу: {attacker_win_chance*100:.1f}% vs {100 - attacker_win_chance*100:.1f}%\n\n"
+        f"🎖️ {winner.username}: {winner.wins} побед / {winner.losses} поражений\n"
+        f"🎖️ {loser.username}: {loser.wins} побед / {loser.losses} поражений"
+    )
+    
+    await war_message.edit_text(result_text)
+    
+    # Отправляем уведомление о возможности новой войны
+    await asyncio.sleep(2)
+    await war_message.answer("⚔️ Новая война будет возможна через 1 минуту.")
 
 async def handle_transfer_money(callback: CallbackQuery):
     """Обработка передачи денег"""
@@ -918,35 +1288,38 @@ async def handle_transfer_money(callback: CallbackQuery):
         return
     
     target_player_id = int(data[2])
+    user_id = callback.from_user.id
     
-    if target_player_id != callback.from_user.id:
+    if target_player_id != user_id:
         await callback.answer("❌ Это не ваша кнопка!")
         return
     
-    user_id = callback.from_user.id
-    chat_id, game = find_player_game(user_id)
+    print(f"💸 Передача денег запрошена пользователем {user_id}")
+    
+    chat_id, game = await find_player_game(user_id)
     
     if not game or not chat_id:
         await callback.answer("❌ Вы не в игре!")
         return
-    
-    # Обновляем доход перед переводом
-    await update_player_income_in_db(user_id, chat_id)
     
     # Проверка на активную войну
     if game["war_active"]:
         await callback.answer("⚔️ Во время войны нельзя передавать деньги!")
         return
     
-    # Проверка, что есть другие игроки
-    players_count = get_game_players_count(chat_id)
-    if players_count < 2:
-        await callback.answer("❌ Нет других игроков для передачи!")
-        return
+    # ПРИНУДИТЕЛЬНО обновляем доход перед передачей
+    income = await update_player_income_in_db(user_id, chat_id)
+    print(f"💰 При передаче денег начислен доход: {income:.2f} монет")
     
-    builder = get_players_keyboard(chat_id, user_id, "transferto")
+    # Показываем выбор игрока
+    builder = await get_players_keyboard(chat_id, user_id, "transmoney")
+    text = "💸 Выберите игрока для передачи денег:"
+    
+    if income > 0:
+        text = f"💰 Вы получили {income:.2f} монет!\n\n" + text
+    
     await callback.message.edit_text(
-        "👤 Выберите игрока, которому хотите передать деньги:",
+        text,
         reply_markup=builder.as_markup()
     )
     await callback.answer()
@@ -959,252 +1332,198 @@ async def handle_transfer_army(callback: CallbackQuery):
         return
     
     target_player_id = int(data[2])
+    user_id = callback.from_user.id
     
-    if target_player_id != callback.from_user.id:
+    if target_player_id != user_id:
         await callback.answer("❌ Это не ваша кнопка!")
         return
     
-    user_id = callback.from_user.id
-    chat_id, game = find_player_game(user_id)
+    print(f"🎖️ Передача армии запрошена пользователем {user_id}")
+    
+    chat_id, game = await find_player_game(user_id)
     
     if not game or not chat_id:
         await callback.answer("❌ Вы не в игре!")
         return
-    
-    # Обновляем доход перед переводом
-    await update_player_income_in_db(user_id, chat_id)
     
     # Проверка на активную войну
     if game["war_active"]:
         await callback.answer("⚔️ Во время войны нельзя передавать армию!")
         return
     
-    # Проверка, что есть другие игроки
-    players_count = get_game_players_count(chat_id)
-    if players_count < 2:
-        await callback.answer("❌ Нет других игроков для передачи!")
-        return
+    # ПРИНУДИТЕЛЬНО обновляем доход перед передачей
+    income = await update_player_income_in_db(user_id, chat_id)
+    print(f"💰 При передаче армии начислен доход: {income:.2f} монет")
     
-    builder = get_players_keyboard(chat_id, user_id, "transferarmyto")
+    # Показываем выбор игрока
+    builder = await get_players_keyboard(chat_id, user_id, "transarmy")
+    text = "🎖️ Выберите игрока для передачи армии:"
+    
+    if income > 0:
+        text = f"💰 Вы получили {income:.2f} монет!\n\n" + text
+    
     await callback.message.edit_text(
-        "👤 Выберите игрока, которому хотите передать армию:",
+        text,
         reply_markup=builder.as_markup()
     )
     await callback.answer()
 
-async def handle_transfer_to_selection(callback: CallbackQuery):
-    """Обработка выбора игрока для передачи"""
+async def handle_transfer_confirmation(callback: CallbackQuery):
+    """Обработка подтверждения передачи"""
+    data = callback.data.split('_')
+    if len(data) != 2:
+        await callback.answer("❌ Ошибка!")
+        return
+    
+    transfer_type = data[0]  # transmoney или transarmy
+    target_id = int(data[1])
     user_id = callback.from_user.id
     
-    # Определяем тип перевода из callback данных
-    callback_data = callback.data
-    if callback_data.startswith("transferto_"):
-        transfer_type = "money"
-        target_id = int(callback_data.split('_')[1])
-    elif callback_data.startswith("transferarmyto_"):
-        transfer_type = "army"
-        target_id = int(callback_data.split('_')[1])
-    else:
-        await callback.answer("❌ Неверный формат данных!")
+    if user_id == target_id:
+        await callback.answer("❌ Нельзя передавать самому себе!")
         return
     
-    # Находим игру
-    chat_id, game = find_player_game(user_id)
+    print(f"✅ Подтверждение передачи {transfer_type} от {user_id} к {target_id}")
+    
+    chat_id, game = await find_player_game(user_id)
+    
     if not game or not chat_id:
-        await callback.answer("❌ Вы не в игре!")
+        await callback.answer("❌ Игра не найдена!")
         return
     
-    # Проверяем, что целевой игрок существует
-    target_player = load_player(target_id, chat_id)
-    if not target_player:
+    # Проверка на активную войну
+    if game["war_active"]:
+        await callback.answer("⚔️ Во время войны нельзя передавать ресурсы!")
+        return
+    
+    # ПРИНУДИТЕЛЬНО обновляем доход перед передачей
+    print(f"💰 Обновляем доход для отправителя {user_id}")
+    await update_player_income_in_db(user_id, chat_id)
+    
+    print(f"💰 Обновляем доход для получателя {target_id}")
+    await update_player_income_in_db(target_id, chat_id)
+    
+    # Загружаем игроков
+    sender = await load_player(user_id, chat_id)
+    receiver = await load_player(target_id, chat_id)
+    
+    if not sender or not receiver:
         await callback.answer("❌ Игрок не найден!")
         return
     
-    if target_id == user_id:
-        await callback.answer("❌ Нельзя передать самому себе!")
-        return
-    
-    # Сохраняем данные перевода
+    # Сохраняем данные перевода для последующего использования
     transfer_data.transfers[user_id] = (target_id, transfer_type, chat_id)
     
-    player = load_player(user_id, chat_id)
-    if not player:
-        await callback.answer("❌ Вы не в игре!")
-        return
-    
-    if transfer_type == "money":
+    if transfer_type == "transmoney":
+        max_amount = int(sender.money)
         await callback.message.edit_text(
-            f"💸 Перевод денег игроку {target_player.username}\n\n"
-            f"💰 У вас есть: {int(player.money)} монет\n"
-            f"👤 Получатель: {target_player.username}\n\n"
-            f"Введите сумму для перевода (комиссия 5%):"
+            f"💸 Вы передаете деньги игроку {receiver.username}\n\n"
+            f"💰 Ваш баланс: {max_amount}\n"
+            f"Введите сумму для передачи (макс. {max_amount}):"
         )
-    else:  # army
-        country = COUNTRIES.get(player.country)
-        if not country:
-            await callback.answer("❌ Ошибка данных страны!")
+    else:  # transarmy
+        max_army = sender.army_level - 1  # Минимум 1 уровень армии должен остаться
+        if max_army <= 0:
+            await callback.answer("❌ У вас минимальный уровень армии!")
             return
         
-        cost_per_level = country.army_cost * player.army_level
-        
         await callback.message.edit_text(
-            f"🎖️ Перевод армии игроку {target_player.username}\n\n"
-            f"⚔️ Ваш уровень армии: {player.army_level}\n"
-            f"⚔️ Уровень получателя: {target_player.army_level}\n"
-            f"💸 Стоимость 1 уровня: {cost_per_level}💰\n\n"
-            f"Введите количество уровней для передачи (максимум {player.army_level - 1}):"
+            f"🎖️ Вы передаете армию игроку {receiver.username}\n\n"
+            f"⚔️ Ваш уровень армии: {sender.army_level}\n"
+            f"Введите количество уровней для передачи (макс. {max_army}):"
         )
     
     await callback.answer()
 
 async def handle_transfer_amount(message: Message):
-    """Обработка ввода суммы для перевода"""
+    """Обработка ввода суммы перевода"""
     user_id = message.from_user.id
     
-    # Проверяем, есть ли активный перевод
     if user_id not in transfer_data.transfers:
-        await message.answer("❌ У вас нет активных переводов!")
         return
     
-    # Получаем данные перевода
     target_id, transfer_type, chat_id = transfer_data.transfers[user_id]
     
-    # Удаляем данные перевода, чтобы предотвратить повторное использование
+    try:
+        amount = int(message.text.strip())
+        if amount <= 0:
+            await message.answer("❌ Сумма должна быть положительной!")
+            return
+    except ValueError:
+        await message.answer("❌ Введите число!")
+        return
+    
+    # Удаляем данные перевода
     del transfer_data.transfers[user_id]
     
-    if not chat_id:
-        await message.answer("❌ Игра не найдена!")
+    # ПРИНУДИТЕЛЬНО обновляем доход перед передачей
+    await update_player_income_in_db(user_id, chat_id)
+    await update_player_income_in_db(target_id, chat_id)
+    
+    # Загружаем игроков
+    sender = await load_player(user_id, chat_id)
+    receiver = await load_player(target_id, chat_id)
+    
+    if not sender or not receiver:
+        await message.answer("❌ Ошибка загрузки данных!")
         return
     
-    player = load_player(user_id, chat_id)
-    target_player = load_player(target_id, chat_id)
-    
-    if not player or not target_player:
-        await message.answer("❌ Игрок не найден!")
-        return
-    
-    if transfer_type == "money":
-        # Перевод денег
+    if transfer_type == "transmoney":
+        max_amount = int(sender.money)
+        if amount > max_amount:
+            await message.answer(f"❌ У вас недостаточно денег! Максимум: {max_amount}")
+            return
+        
+        # Выполняем перевод
+        sender.money -= amount
+        receiver.money += amount
+        
+        await save_player(sender, chat_id)
+        await save_player(receiver, chat_id)
+        
+        await message.answer(
+            f"✅ Вы передали {amount}💰 игроку {receiver.username}\n"
+            f"💰 Ваш новый баланс: {int(sender.money)}"
+        )
+        
+        # Уведомляем получателя
         try:
-            amount = float(message.text.replace(',', '.'))
-            if amount <= 0:
-                await message.answer("❌ Сумма должна быть больше 0!")
-                return
-            
-            if player.money < amount:
-                await message.answer(f"❌ У вас недостаточно денег! У вас {int(player.money)}💰")
-                return
-            
-            # Комиссия 5%
-            commission = amount * 0.05
-            transfer_amount = amount - commission
-            
-            # Выполняем перевод
-            player.money -= amount
-            target_player.money += transfer_amount
-            
-            # Сохраняем изменения
-            save_player(player, chat_id)
-            save_player(target_player, chat_id)
-            
-            await message.answer(
-                f"✅ Перевод успешно выполнен!\n\n"
-                f"📤 Отправитель: {player.username}\n"
-                f"📥 Получатель: {target_player.username}\n"
-                f"💰 Сумма перевода: {int(transfer_amount)}💰\n"
-                f"💸 Комиссия (5%): {int(commission)}💰\n"
-                f"💵 Ваш баланс: {int(player.money)}💰"
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"🎁 Вы получили {amount}💰 от {sender.username}!"
             )
-            
-            # Уведомляем получателя, если он в другом чате
-            try:
-                target_chat_id, _ = find_player_game(target_id)
-                if target_chat_id and target_chat_id != message.chat.id:
-                    await bot.send_message(
-                        target_chat_id,
-                        f"💰 Вы получили перевод!\n"
-                        f"📤 От: {player.username}\n"
-                        f"💸 Сумма: {int(transfer_amount)}💰\n"
-                        f"💵 Ваш баланс: {int(target_player.money)}💰"
-                    )
-            except:
-                pass
-            
-            # Показываем обновленное меню
-            await update_player_menu(message, player)
-            
-        except ValueError:
-            await message.answer("❌ Пожалуйста, введите число!")
-    
-    else:
-        # Перевод армии
+        except:
+            pass
+        
+    else:  # transarmy
+        max_army = sender.army_level - 1
+        if amount > max_army:
+            await message.answer(f"❌ Нельзя передать столько уровней! Максимум: {max_army}")
+            return
+        
+        # Выполняем перевод армии
+        sender.army_level -= amount
+        receiver.army_level += amount
+        
+        await save_player(sender, chat_id)
+        await save_player(receiver, chat_id)
+        
+        await message.answer(
+            f"✅ Вы передали {amount} уровней армии игроку {receiver.username}\n"
+            f"⚔️ Ваш новый уровень: {sender.army_level}"
+        )
+        
+        # Уведомляем получателя
         try:
-            amount = int(message.text)
-            if amount <= 0:
-                await message.answer("❌ Количество должно быть больше 0!")
-                return
-            
-            if player.army_level <= 1:
-                await message.answer("❌ У вас минимальный уровень армии!")
-                return
-            
-            # Максимальное количество уровней для передачи
-            max_transfer = player.army_level - 1
-            if amount > max_transfer:
-                await message.answer(f"❌ Вы можете передать максимум {max_transfer} уровней!")
-                return
-            
-            # Стоимость передачи
-            country = COUNTRIES.get(player.country)
-            if not country:
-                await message.answer("❌ Ошибка данных страны!")
-                return
-            
-            cost_per_level = country.army_cost * player.army_level
-            total_cost = cost_per_level * amount
-            
-            if player.money < total_cost:
-                await message.answer(f"❌ У вас недостаточно денег! Нужно {total_cost}💰")
-                return
-            
-            # Выполняем передачу армии
-            player.money -= total_cost
-            player.army_level -= amount
-            target_player.army_level += amount
-            
-            # Сохраняем изменения
-            save_player(player, chat_id)
-            save_player(target_player, chat_id)
-            
-            await message.answer(
-                f"✅ Перевод армии успешно выполнен!\n\n"
-                f"📤 Отправитель: {player.username}\n"
-                f"📥 Получатель: {target_player.username}\n"
-                f"🎖️ Уровней передано: {amount}\n"
-                f"💸 Стоимость: {total_cost}💰\n"
-                f"⚔️ Ваш уровень армии: {player.army_level}\n"
-                f"⚔️ Уровень получателя: {target_player.army_level}"
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"🎁 Вы получили {amount} уровней армии от {sender.username}! Новый уровень: {receiver.army_level}"
             )
-            
-            # Уведомляем получателя, если он в другом чате
-            try:
-                target_chat_id, _ = find_player_game(target_id)
-                if target_chat_id and target_chat_id != message.chat.id:
-                    await bot.send_message(
-                        target_chat_id,
-                        f"🎖️ Вы получили армию!\n"
-                        f"📤 От: {player.username}\n"
-                        f"⚔️ Уровней получено: {amount}\n"
-                        f"⚔️ Ваш уровень армии: {target_player.army_level}"
-                    )
-            except:
-                pass
-            
-            # Показываем обновленное меню
-            await update_player_menu(message, player)
-            
-        except ValueError:
-            await message.answer("❌ Пожалуйста, введите целое число!")
+        except:
+            pass
+    
+    # Обновляем меню отправителя
+    await show_player_menu(message, sender)
 
 async def handle_cancel(callback: CallbackQuery):
     """Обработка отмены действия"""
@@ -1214,276 +1533,134 @@ async def handle_cancel(callback: CallbackQuery):
         return
     
     target_player_id = int(data[1])
-    
-    if target_player_id != callback.from_user.id:
-        await callback.answer("❌ Это не ваша кнопка!")
-        return
-    
-    # Удаляем активный перевод, если есть
-    if target_player_id in transfer_data.transfers:
-        del transfer_data.transfers[target_player_id]
-    
-    await show_player_menu(callback.message)
-    await callback.answer("❌ Действие отменено")
-
-async def handle_start_war(callback: CallbackQuery):
-    """Обработка начала войны"""
-    data = callback.data.split('_')
-    if len(data) != 3:
-        await callback.answer("❌ Ошибка!")
-        return
-    
-    target_player_id = int(data[2])
-    
-    if target_player_id != callback.from_user.id:
-        await callback.answer("❌ Это не ваша кнопка!")
-        return
-    
     user_id = callback.from_user.id
-    chat_id, game = find_player_game(user_id)
     
-    if not game or not chat_id:
-        await callback.answer("❌ Вы не в игре!")
-        return
-    
-    # Обновляем доход перед войной
-    await update_player_income_in_db(user_id, chat_id)
-    
-    # Проверка на активную войну
-    if game["war_active"]:
-        await callback.answer("⚔️ Война уже идет!")
-        return
-    
-    # Проверка кулдауна (минимум 5 минут между войнами)
-    if game["last_war"] and (datetime.now() - game["last_war"]).total_seconds() < 300:
-        remaining = 300 - (datetime.now() - game["last_war"]).total_seconds()
-        await callback.answer(f"⏳ До следующей войны осталось: {int(remaining)} сек")
-        return
-    
-    # Проверка, что есть другие игроки
-    players_count = get_game_players_count(chat_id)
-    if players_count < 2:
-        await callback.answer("❌ Недостаточно игроков для войны!")
-        return
-    
-    builder = get_war_targets_keyboard(chat_id, user_id)
-    await callback.message.edit_text(
-        "🎯 Выберите противника для войны:",
-        reply_markup=builder.as_markup()
-    )
-    await callback.answer()
-
-async def handle_war_target(callback: CallbackQuery):
-    """Обработка выбора цели для войны"""
-    user_id = callback.from_user.id
-    chat_id, game = find_player_game(user_id)
-    
-    if not game or not chat_id:
-        await callback.answer("❌ Вы не в игре!")
-        return
-    
-    target_id = int(callback.data.split('_')[1])
-    
-    if target_id == user_id:
-        await callback.answer("❌ Нельзя воевать с самим собой!")
-        return
-    
-    target_player = load_player(target_id, chat_id)
-    if not target_player:
-        await callback.answer("❌ Игрок не найден!")
-        return
-    
-    # Обновляем доход игроков перед войной
-    await update_player_income_in_db(user_id, chat_id)
-    await update_player_income_in_db(target_id, chat_id)
-    
-    # Начало войны
-    game["war_active"] = True
-    game["war_participants"] = [user_id, target_id]
-    game["war_start_time"] = datetime.now()
-    
-    # Сохраняем обновленную игру
-    save_game(
-        chat_id=chat_id,
-        creator_id=game["creator_id"],
-        war_active=True,
-        war_participants=game["war_participants"],
-        war_start_time=game["war_start_time"],
-        last_war=game["last_war"]
-    )
-    
-    attacker = load_player(user_id, chat_id)
-    attacker_country = COUNTRIES.get(attacker.country) if attacker else None
-    target_country = COUNTRIES.get(target_player.country) if target_player else None
-    
-    if not attacker or not attacker_country or not target_country:
-        await callback.answer("❌ Ошибка данных!")
-        return
-    
-    war_message = (
-        f"⚔️ ⚔️ ⚔️ ВОЙНА НАЧАЛАСЬ! ⚔️ ⚔️ ⚔️\n\n"
-        f"{attacker_country.emoji} {attacker.username} объявил войну {target_country.emoji} {target_player.username}!\n\n"
-        f"Бой будет длиться 60 секунд. Победит тот, у кого выше уровень армии!"
-    )
-    
-    await callback.message.edit_text(war_message)
-    
-    # Отправляем изображение войны
-    await send_war_image(chat_id, attacker_country, target_country)
-    
-    # Запуск таймера войны
-    asyncio.create_task(war_countdown(chat_id))
-
-async def war_countdown(chat_id: int):
-    """Таймер войны"""
-    await asyncio.sleep(60)  # Война длится 60 секунд
-    
-    game = load_game(chat_id)
-    if not game:
-        return
-    
-    if not game["war_active"] or len(game["war_participants"]) != 2:
-        # Сбрасываем состояние войны
-        game["war_active"] = False
-        game["war_participants"] = []
-        game["war_start_time"] = None
-        save_game(
-            chat_id=chat_id,
-            creator_id=game["creator_id"],
-            war_active=False,
-            war_participants=[],
-            war_start_time=None,
-            last_war=game["last_war"]
-        )
-        return
-    
-    # Определение победителя
-    attacker_id = game["war_participants"][0]
-    target_id = game["war_participants"][1]
-    
-    attacker = load_player(attacker_id, chat_id)
-    target = load_player(target_id, chat_id)
-    
-    if not attacker or not target:
-        # Сбрасываем состояние войны
-        game["war_active"] = False
-        game["war_participants"] = []
-        game["war_start_time"] = None
-        save_game(
-            chat_id=chat_id,
-            creator_id=game["creator_id"],
-            war_active=False,
-            war_participants=[],
-            war_start_time=None,
-            last_war=game["last_war"]
-        )
-        return
-    
-    attacker_power = attacker.army_level * (1 + 0.1 * attacker.city_level)
-    target_power = target.army_level * (1 + 0.1 * target.city_level)
-    
-    # Добавление случайности
-    attacker_power *= random.uniform(0.9, 1.1)
-    target_power *= random.uniform(0.9, 1.1)
-    
-    if attacker_power > target_power:
-        winner = attacker
-        loser = target
-        winner.wins += 1
-        loser.losses += 1
-        
-        # Награда победителю
-        loot = loser.money * 0.1  # 10% денег проигравшего
-        winner.money += loot
-        loser.money -= loot
-        
-        result_message = (
-            f"🎉 ВОЙНА ОКОНЧЕНА! 🎉\n\n"
-            f"🏆 ПОБЕДИТЕЛЬ: {COUNTRIES.get(winner.country, COUNTRIES['russia']).emoji} {winner.username}\n"
-            f"💀 ПРОИГРАВШИЙ: {COUNTRIES.get(loser.country, COUNTRIES['russia']).emoji} {loser.username}\n\n"
-            f"⚔️ Сила атаки: {attacker_power:.1f} vs {target_power:.1f}\n"
-            f"💰 Добыча: {int(loot)} монет"
-        )
-    else:
-        winner = target
-        loser = attacker
-        winner.wins += 1
-        loser.losses += 1
-        
-        loot = loser.money * 0.1
-        winner.money += loot
-        loser.money -= loot
-        
-        result_message = (
-            f"🎉 ВОЙНА ОКОНЧЕНА! 🎉\n\n"
-            f"🏆 ПОБЕДИТЕЛЬ: {COUNTRIES.get(winner.country, COUNTRIES['russia']).emoji} {winner.username}\n"
-            f"💀 ПРОИГРАВШИЙ: {COUNTRIES.get(loser.country, COUNTRIES['russia']).emoji} {loser.username}\n\n"
-            f"⚔️ Сила атаки: {attacker_power:.1f} vs {target_power:.1f}\n"
-            f"💰 Добыча: {int(loot)} монет"
-        )
-    
-    # Сохраняем изменения игроков
-    save_player(winner, chat_id)
-    save_player(loser, chat_id)
-    
-    # Сброс состояния войны
-    game["war_active"] = False
-    game["war_participants"] = []
-    game["war_start_time"] = None
-    game["last_war"] = datetime.now()
-    
-    # Сохраняем обновленную игру
-    save_game(
-        chat_id=chat_id,
-        creator_id=game["creator_id"],
-        war_active=False,
-        war_participants=[],
-        war_start_time=None,
-        last_war=game["last_war"]
-    )
-    
-    # Отправка результата
-    await bot.send_message(chat_id, result_message)
-
-async def handle_refresh(callback: CallbackQuery):
-    """Обработка обновления"""
-    data = callback.data.split('_')
-    if len(data) != 2:
-        await callback.answer("❌ Ошибка!")
-        return
-    
-    target_player_id = int(data[1])
-    
-    if target_player_id != callback.from_user.id:
+    if target_player_id != user_id:
         await callback.answer("❌ Это не ваша кнопка!")
         return
     
+    print(f"❌ Отмена действия пользователем {user_id}")
+    
+    # Удаляем данные перевода, если они есть
+    if user_id in transfer_data.transfers:
+        del transfer_data.transfers[user_id]
+    
+    # Возвращаемся в главное меню
     await show_player_menu(callback.message)
-    await callback.answer("🔄 Обновлено!")
 
-async def handle_reset(message: Message):
-    """Обработка команды /reset (только для админов)"""
-    if message.chat.type == "private":
-        await message.answer("🎮 Игра доступна только в групповых чатах!")
+async def handle_admin_reset(message: Message):
+    """Обработка команды сброса игры (только для админов)"""
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("❌ У вас нет прав для этой команды!")
         return
     
     chat_id = message.chat.id
-    user_id = message.from_user.id
     
-    # Проверка прав администратора
-    if not await is_admin_in_chat(chat_id, user_id):
-        await message.answer("❌ Только администраторы могут сбрасывать игру!")
+    # Удаляем игру
+    await delete_game(chat_id)
+    
+    await message.answer("✅ Игра полностью сброшена! Для начала новой игры используйте /game")
+
+async def handle_admin_income(message: Message):
+    """Обработка команды принудительного обновления дохода (только для админов)"""
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("❌ У вас нет прав для этой команды!")
         return
     
-    delete_game(chat_id)
-    await message.answer("✅ Игра сброшена администратором!")
+    await force_update_all_incomes()
+    await message.answer("✅ Доход обновлен для всех игроков!")
+
+async def handle_admin_debug(message: Message):
+    """Команда для отладки конкретного пользователя"""
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("❌ У вас нет прав для этой команды!")
+        return
+    
+    try:
+        # Извлекаем user_id из команды /debug_123456
+        command = message.text.split()
+        if len(command) != 2:
+            await message.answer("❌ Использование: /debug USER_ID")
+            return
+        
+        debug_user_id = int(command[1])
+        
+        # Находим игру пользователя
+        chat_id, game = await find_player_game(debug_user_id)
+        
+        if not chat_id or not game:
+            await message.answer(f"❌ Пользователь {debug_user_id} не найден в игре")
+            return
+        
+        # Загружаем игрока
+        player = await load_player(debug_user_id, chat_id)
+        if not player:
+            await message.answer(f"❌ Не удалось загрузить данные игрока {debug_user_id}")
+            return
+        
+        # Обновляем доход
+        income = await update_player_income_in_db(debug_user_id, chat_id)
+        
+        # Загружаем обновленного игрока
+        player = await load_player(debug_user_id, chat_id)
+        
+        # Отправляем отладочную информацию
+        country = COUNTRIES.get(player.country, Country("Неизвестно", "❓", 0))
+        
+        debug_text = (
+            f"🔍 ОТЛАДКА ИГРОКА {player.username} (ID: {debug_user_id})\n\n"
+            f"🌍 Страна: {country.emoji} {player.country}\n"
+            f"💰 Деньги: {player.money:.2f}\n"
+            f"⚔️ Уровень армии: {player.army_level}\n"
+            f"🏙️ Уровень города: {player.city_level}\n"
+            f"⏰ Последний доход: {player.last_income}\n"
+            f"🕒 Текущее время: {datetime.now()}\n"
+            f"⏱️ Разница: {(datetime.now() - player.last_income).total_seconds():.1f} сек\n"
+            f"📈 Пассивный доход: {country.base_income * player.city_level:.1f}/сек\n"
+            f"💸 Начислено сейчас: {income:.2f} монет\n"
+            f"🎮 Чат игры: {chat_id}\n"
+            f"⚔️ Война активна: {'Да' if game['war_active'] else 'Нет'}"
+        )
+        
+        await message.answer(debug_text)
+        
+    except Exception as e:
+        await message.answer(f"❌ Ошибка отладки: {e}")
+
+# ========== ФОНОВАЯ ЗАДАЧА ОБНОВЛЕНИЯ ДОХОДА ==========
+
+async def income_background_task():
+    """Фоновая задача для обновления дохода"""
+    while True:
+        try:
+            print("🔄 Запуск фонового обновления дохода...")
+            
+            # Обновляем доход для всех игроков во всех чатах
+            games = await get_all_games()
+            
+            print(f"📊 Найдено {len(games)} активных игр")
+            
+            for chat_id, game in games.items():
+                if not game["war_active"]:  # Если нет активной войны
+                    print(f"   Обновляем чат {chat_id}")
+                    await update_all_players_income_in_chat(chat_id)
+            
+            print("✅ Фоновое обновление завершено")
+            
+            # Ждем 5 секунд перед следующим обновлением
+            await asyncio.sleep(5)
+            
+        except Exception as e:
+            print(f"❌ Ошибка в фоновой задаче обновления дохода: {e}")
+            await asyncio.sleep(10)
+
+# ========== ЗАПУСК БОТА ==========
 
 async def main():
-    """Основная функция"""
     global bot
     
     # Инициализация базы данных
-    init_database()
+    await init_database()
     
     # Инициализация бота
     bot = Bot(token=TOKEN)
@@ -1494,8 +1671,10 @@ async def main():
     dp.message.register(handle_start, Command("start"))
     dp.message.register(handle_game, Command("game"))
     dp.message.register(handle_join, Command("join"))
-    dp.message.register(handle_reset, Command("reset"))
-    dp.message.register(handle_transfer_amount)
+    dp.message.register(handle_admin_reset, Command("reset"))
+    dp.message.register(handle_admin_income, Command("update_income"))
+    dp.message.register(handle_admin_debug, Command("debug"))
+    dp.message.register(handle_transfer_amount, F.text.regexp(r'^\d+$'))
     
     # Регистрация обработчиков callback-запросов
     dp.callback_query.register(handle_country_selection, F.data.startswith("country_"))
@@ -1503,21 +1682,27 @@ async def main():
     dp.callback_query.register(handle_upgrade_army, F.data.startswith("upgrade_army_"))
     dp.callback_query.register(handle_upgrade_city, F.data.startswith("upgrade_city_"))
     dp.callback_query.register(handle_top, F.data.startswith("top_"))
-    dp.callback_query.register(handle_start_war, F.data.startswith("start_war_"))
-    dp.callback_query.register(handle_war_target, F.data.startswith("wartarget_"))
     dp.callback_query.register(handle_refresh, F.data.startswith("refresh_"))
     dp.callback_query.register(handle_change_country, F.data.startswith("change_country_"))
+    dp.callback_query.register(handle_start_war, F.data.startswith("start_war_"))
+    dp.callback_query.register(handle_war_target, F.data.startswith("wartarget_"))
     dp.callback_query.register(handle_transfer_money, F.data.startswith("transfer_money_"))
     dp.callback_query.register(handle_transfer_army, F.data.startswith("transfer_army_"))
-    dp.callback_query.register(handle_transfer_to_selection, F.data.startswith("transferto_"))
-    dp.callback_query.register(handle_transfer_to_selection, F.data.startswith("transferarmyto_"))
+    dp.callback_query.register(handle_transfer_confirmation, F.data.startswith("transmoney_") | F.data.startswith("transarmy_"))
     dp.callback_query.register(handle_cancel, F.data.startswith("cancel_"))
     
-    # Запуск обновления дохода
-    asyncio.create_task(update_income())
+    # Запуск фоновой задачи обновления дохода
+    asyncio.create_task(income_background_task())
     
-    # Запуск бота
-    await bot.delete_webhook(drop_pending_updates=True)
+    print("=" * 50)
+    print("✅ Бот запущен и готов к работе!")
+    print(f"👑 Админ ID: {ADMIN_ID}")
+    print(f"📁 Папка для изображений войны: {WAR_IMAGES_FOLDER}")
+    print(f"💾 База данных: {DATABASE_FILE}")
+    print("💰 Система пассивного дохода активна (обновление каждые 5 секунд)")
+    print("🔍 Для отладки используйте команду /debug USER_ID")
+    print("=" * 50)
+    
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
